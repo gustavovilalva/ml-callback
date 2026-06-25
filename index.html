@@ -1,128 +1,360 @@
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>ML Compras — Autorização</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f4f6f9;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-    }
-    .card {
-      background: #fff;
-      border-radius: 16px;
-      padding: 40px 48px;
-      box-shadow: 0 4px 24px rgba(0,0,0,.1);
-      text-align: center;
-      max-width: 480px;
-      width: 90%;
-    }
-    .logo { font-size: 48px; margin-bottom: 12px; }
-    h1 { font-size: 22px; font-weight: 700; color: #222; margin: 0 0 8px; }
-    p  { color: #666; font-size: 14px; margin: 0 0 24px; }
+import os
+import requests
+from flask import Flask, render_template, jsonify, request, redirect, url_for, session
+from dotenv import load_dotenv
+from collections import defaultdict
+import json
+import secrets
 
-    .code-box {
-      background: #f0f4ff;
-      border: 2px solid #2968c8;
-      border-radius: 10px;
-      padding: 16px 20px;
-      font-family: monospace;
-      font-size: 13px;
-      word-break: break-all;
-      color: #1a3a6e;
-      text-align: left;
-      margin-bottom: 16px;
-    }
-    .btn-copy {
-      background: #2968c8;
-      color: #fff;
-      border: none;
-      padding: 12px 28px;
-      border-radius: 8px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      width: 100%;
-      transition: background .2s;
-    }
-    .btn-copy:hover { background: #1a52a8; }
-    .btn-copy.copied { background: #00a650; }
+load_dotenv()
 
-    .error {
-      background: #fff0f0;
-      border: 2px solid #f44;
-      border-radius: 10px;
-      padding: 16px;
-      color: #c00;
-      font-size: 14px;
-    }
-    .step {
-      background: #fffbea;
-      border: 1px solid #ffd700;
-      border-radius: 8px;
-      padding: 12px 16px;
-      font-size: 13px;
-      color: #7a5c00;
-      margin-top: 16px;
-      text-align: left;
-    }
-    .step strong { display: block; margin-bottom: 4px; }
-  </style>
-</head>
-<body>
-<div class="card">
-  <div class="logo">🛒</div>
-  <h1>ML Compras Dashboard</h1>
-  <p id="subtitle">Processando autorização...</p>
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET", secrets.token_hex(24))
 
-  <div id="content"></div>
-</div>
+ML_API_BASE = "https://api.mercadolibre.com"
+ML_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
+ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
+REDIRECT_URI = "https://gustavovilalva.github.io/ml-callback/"
 
-<script>
-  const params = new URLSearchParams(window.location.search);
-  const code   = params.get('code');
-  const error  = params.get('error');
-  const content = document.getElementById('content');
-  const subtitle = document.getElementById('subtitle');
 
-  if (error) {
-    subtitle.textContent = 'Erro na autorização';
-    content.innerHTML = `<div class="error">❌ ${error}: ${params.get('error_description') || 'Tente novamente.'}</div>`;
+# ─────────────────────────────────────────────
+# Helpers de autenticação
+# ─────────────────────────────────────────────
 
-  } else if (code) {
-    subtitle.textContent = 'Autorização concluída! Copie o código abaixo.';
-    content.innerHTML = `
-      <div class="code-box" id="code-display">${code}</div>
-      <button class="btn-copy" id="btn" onclick="copyCode()">📋 Copiar código</button>
-      <div class="step">
-        <strong>Próximo passo:</strong>
-        Volte ao dashboard em <strong>http://localhost:5000</strong>,
-        cole este código no campo indicado e clique em "Conectar".
-      </div>`;
+def get_access_token():
+    """Retorna o access token atual (da sessão ou do .env)."""
+    return session.get("access_token") or os.getenv("ML_ACCESS_TOKEN", "")
 
-  } else {
-    subtitle.textContent = 'Nenhum código encontrado.';
-    content.innerHTML = `<div class="error">Nenhum código de autorização foi recebido. Certifique-se de acessar esta página pelo fluxo de login do dashboard.</div>`;
-  }
 
-  function copyCode() {
-    const code = document.getElementById('code-display').textContent;
-    navigator.clipboard.writeText(code).then(() => {
-      const btn = document.getElementById('btn');
-      btn.textContent = '✅ Copiado!';
-      btn.classList.add('copied');
-      setTimeout(() => {
-        btn.textContent = '📋 Copiar código';
-        btn.classList.remove('copied');
-      }, 2000);
-    });
-  }
-</script>
-</body>
-</html>
+def refresh_access_token():
+    """Tenta renovar o access token usando o refresh token."""
+    refresh_token = session.get("refresh_token") or os.getenv("ML_REFRESH_TOKEN", "")
+    app_id = os.getenv("ML_APP_ID", "")
+    client_secret = os.getenv("ML_CLIENT_SECRET", "")
+
+    if not refresh_token or not app_id or not client_secret:
+        return None
+
+    resp = requests.post(
+        "https://api.mercadolibre.com/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": app_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+        },
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if resp.ok:
+        data = resp.json()
+        session["access_token"] = data.get("access_token")
+        session["refresh_token"] = data.get("refresh_token")
+        return data.get("access_token")
+    return None
+
+
+def ml_get(path, params=None, retry=True):
+    """GET autenticado na API do ML com auto-refresh de token."""
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {})
+
+    if resp.status_code == 401 and retry:
+        new_token = refresh_access_token()
+        if new_token:
+            headers["Authorization"] = f"Bearer {new_token}"
+            resp = requests.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {})
+
+    return resp
+
+
+# ─────────────────────────────────────────────
+# Busca de pedidos
+# ─────────────────────────────────────────────
+
+def get_seller_id():
+    resp = ml_get("/users/me")
+    if resp.ok:
+        return resp.json().get("id")
+    return None
+
+
+def fetch_orders_to_ship(seller_id):
+    """
+    Busca todos os pedidos prontos para enviar e/ou com pagamento confirmado.
+    Faz paginação automática.
+    """
+    statuses = ["ready_to_ship", "payment_done"]
+    all_orders = []
+
+    for status in statuses:
+        offset = 0
+        limit = 50
+        while True:
+            resp = ml_get(
+                "/orders/search",
+                params={
+                    "seller": seller_id,
+                    "order.status": status,
+                    "limit": limit,
+                    "offset": offset,
+                    "sort": "date_desc",
+                },
+            )
+            if not resp.ok:
+                break
+
+            data = resp.json()
+            results = data.get("results", [])
+            all_orders.extend(results)
+
+            paging = data.get("paging", {})
+            total = paging.get("total", 0)
+            offset += limit
+
+            if offset >= total or not results:
+                break
+
+    return all_orders
+
+
+def aggregate_orders(orders):
+    """
+    Agrega pedidos por produto + variação.
+    Retorna lista de dicts com: title, variation, sku, quantity, order_ids
+    """
+    agg = defaultdict(lambda: {
+        "title": "",
+        "variation": "",
+        "variation_id": None,
+        "sku": "",
+        "item_id": "",
+        "quantity": 0,
+        "order_count": 0,
+        "order_ids": [],
+    })
+
+    for order in orders:
+        order_id = order.get("id")
+        for item in order.get("order_items", []):
+            item_data = item.get("item", {})
+            title = item_data.get("title", "Sem título")
+            item_id = item_data.get("id", "")
+            variation_id = item_data.get("variation_id")
+            sku = item_data.get("seller_sku") or item_data.get("seller_custom_field") or ""
+            quantity = item.get("quantity", 0)
+
+            # Busca atributos da variação (cor, tamanho, etc.)
+            variation_attrs = item_data.get("variation_attributes", [])
+            variation_str = ", ".join(
+                f"{a.get('name')}: {a.get('value_name')}"
+                for a in variation_attrs
+                if a.get("value_name")
+            )
+
+            key = (item_id, variation_id or "sem_variacao")
+            agg[key]["title"] = title
+            agg[key]["variation"] = variation_str or "Padrão"
+            agg[key]["variation_id"] = variation_id
+            agg[key]["sku"] = sku
+            agg[key]["item_id"] = item_id
+            agg[key]["quantity"] += quantity
+            agg[key]["order_count"] += 1
+            if order_id not in agg[key]["order_ids"]:
+                agg[key]["order_ids"].append(order_id)
+
+    result = sorted(agg.values(), key=lambda x: x["quantity"], reverse=True)
+    return result
+
+
+# ─────────────────────────────────────────────
+# Rotas
+# ─────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    token = get_access_token()
+    return render_template("index.html", has_token=bool(token))
+
+
+@app.route("/login")
+def login():
+    """Inicia o fluxo OAuth com o Mercado Livre."""
+    app_id = os.getenv("ML_APP_ID", "")
+    if not app_id:
+        return "Configure ML_APP_ID no arquivo .env", 400
+
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+
+    auth_url = (
+        f"{ML_AUTH_URL}"
+        f"?response_type=code"
+        f"&client_id={app_id}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&state={state}"
+    )
+    return redirect(auth_url)
+
+
+@app.route("/callback")
+def callback():
+    """Recebe o código via GET (redirecionado pelo GitHub Pages) e troca pelo token."""
+    code = request.args.get("code", "").strip()
+    error = request.args.get("error", "")
+
+    if error:
+        return render_template("index.html", has_token=False,
+                               auth_error=f"Erro na autorização: {error}")
+    if not code:
+        return render_template("index.html", has_token=False,
+                               auth_error="Código não recebido. Tente novamente.")
+
+    app_id = os.getenv("ML_APP_ID", "")
+    client_secret = os.getenv("ML_CLIENT_SECRET", "")
+
+    resp = requests.post(
+        ML_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": app_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+        },
+        headers={"Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    if not resp.ok:
+        return render_template("index.html", has_token=False,
+                               auth_error=f"Erro ao obter token: {resp.text}")
+
+    data = resp.json()
+    session["access_token"] = data.get("access_token")
+    session["refresh_token"] = data.get("refresh_token")
+    return redirect(url_for("index"))
+
+
+@app.route("/trocar-codigo", methods=["POST"])
+def trocar_codigo():
+    """
+    Aceita o código diretamente (copiado da página GitHub Pages)
+    ou a URL completa de redirect.
+    """
+    from urllib.parse import urlparse, parse_qs
+
+    codigo_direto = request.form.get("codigo", "").strip()
+    url_colada = request.form.get("redirect_url", "").strip()
+
+    # Aceita código direto ou extrai de uma URL completa
+    if codigo_direto:
+        code = codigo_direto
+    elif url_colada:
+        parsed = urlparse(url_colada)
+        params = parse_qs(parsed.query)
+        code = params.get("code", [None])[0]
+    else:
+        return render_template("index.html", has_token=False,
+                               auth_error="Cole o código de autorização.")
+
+    if not code:
+        return render_template("index.html", has_token=False,
+                               auth_error="Código não encontrado na URL. Certifique-se de copiar a URL completa após o login.")
+
+    app_id = os.getenv("ML_APP_ID", "")
+    client_secret = os.getenv("ML_CLIENT_SECRET", "")
+
+    resp = requests.post(
+        ML_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": app_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+        },
+        headers={"Accept": "application/json",
+                 "Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    if not resp.ok:
+        return render_template("index.html", has_token=False,
+                               auth_error=f"Erro ao obter token: {resp.text}")
+
+    data = resp.json()
+    session["access_token"] = data.get("access_token")
+    session["refresh_token"] = data.get("refresh_token")
+    return redirect(url_for("index"))
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+
+@app.route("/config", methods=["POST"])
+def config():
+    """Salva o access token manualmente na sessão (fallback)."""
+    access_token = request.form.get("access_token", "").strip()
+    refresh_token = request.form.get("refresh_token", "").strip()
+    if access_token:
+        session["access_token"] = access_token
+    if refresh_token:
+        session["refresh_token"] = refresh_token
+    return redirect(url_for("index"))
+
+
+@app.route("/api/pedidos")
+def api_pedidos():
+    """Endpoint JSON com o resumo agregado de pedidos a enviar."""
+    token = get_access_token()
+    if not token:
+        return jsonify({"error": "Token não configurado"}), 401
+
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Não foi possível obter o ID do vendedor. Verifique o token."}), 403
+
+    orders = fetch_orders_to_ship(seller_id)
+    aggregated = aggregate_orders(orders)
+
+    return jsonify({
+        "total_orders": len(orders),
+        "total_skus": len(aggregated),
+        "items": aggregated,
+    })
+
+
+@app.route("/api/save_boxes", methods=["POST"])
+def save_boxes():
+    """Salva as configurações de unid/caixa em arquivo local."""
+    data = request.json or {}
+    config_path = os.path.join(os.path.dirname(__file__), "boxes_config.json")
+    try:
+        existing = {}
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                existing = json.load(f)
+        existing.update(data)
+        with open(config_path, "w") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/load_boxes")
+def load_boxes():
+    """Carrega as configurações de unid/caixa salvas."""
+    config_path = os.path.join(os.path.dirname(__file__), "boxes_config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            return jsonify(json.load(f))
+    return jsonify({})
+
+
+if __name__ == "__main__":
+    # HTTPS com certificado auto-assinado (necessário para o callback do ML)
+    app.run(debug=True, port=5000, ssl_context="adhoc")
